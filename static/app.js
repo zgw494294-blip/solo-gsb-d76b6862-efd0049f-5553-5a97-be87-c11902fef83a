@@ -80,6 +80,7 @@ function scheduleSolve(delay = 200) {
   markTransitionStaleness();
   markCycleStaleness();
   markExtractStaleness();
+  markMergeStaleness();
 }
 
 // ------------------------------------------------------------ 渲染输入 --
@@ -529,6 +530,7 @@ function showErrors(errors) {
   elStatus.className = "status";
   elResultBody.innerHTML = `<div class="result-empty">修正输入后将自动重新计算。</div>`;
   $("#inferCard").hidden = true;
+  $("#mergeCard").hidden = true;
 }
 
 // ------------------------------------------------------------ 结果渲染 --
@@ -576,6 +578,7 @@ function renderResult(r) {
   renderReviewBgOptions();
   syncInferPanel(r);
   syncTransitionPanel(r);
+  syncMergePanel(r);
 }
 
 function renderSample(s) {
@@ -967,6 +970,14 @@ document.addEventListener("change", (e) => {
   } else if (act === "review-bg") {
     reviewState.selectedBackground = t.value;
     markReviewStaleness();
+  } else if (act === "merge-lower") {
+    mergeState.lowerId = t.value;
+    markMergeStaleness();
+    updateMergeRunHint();
+  } else if (act === "merge-upper") {
+    mergeState.upperId = t.value;
+    markMergeStaleness();
+    updateMergeRunHint();
   }
 });
 
@@ -995,6 +1006,8 @@ document.addEventListener("click", (e) => {
   if (btn.dataset.act === "transition-exec-start") startTransitionExecution();
   if (btn.dataset.act === "transition-exec-confirm") confirmTransitionStep(Number(btn.dataset.step));
   if (btn.dataset.act === "cycle-confirm") confirmCyclePlan();
+  if (btn.dataset.act === "merge-run") runMerge();
+  if (btn.dataset.act === "merge-confirm") confirmMergePlan();
 });
 
 // 响应守卫：只有「当前在途请求」且「发出后参与输入未再变化」的响应可以落地。
@@ -1184,6 +1197,325 @@ function applyInferResult() {
   noteSolveInputChanged();
   markCycleStaleness();
   markTransitionStaleness();
+  markMergeStaleness();
+  runSolve();
+}
+
+// ============================================================ 相邻同色图层合并 ==
+//
+// 把「当前有效最佳叠序」（最近一次成功求解、且仍对应当前校准输入的 order）中
+// 相邻且规范化 HEX 相同的两层合并为一层：保留下层 ID 与颜色，不透明度取
+// 1−(1−a下)(1−a上)，删除上层，其余图层与样本不变；关系中的上层 ID 改为下层
+// ID，两层间关系移除，重复对保留首次出现者。页面先展示待确认方案，确认后才
+// 整批写回图层与关系，并沿用输入变更流程重新求解（旧调序执行立即终止、
+// 已确认记录保留）；生成失败不改动任何输入。
+//
+// 失效与请求竞态规则（与反推 / 过渡同样严格）：
+//  - 参与输入：图层、样本、先后关系、所选两层（下层 / 上层）与当前有效最佳
+//    叠序。方案展示后上述任一变化即永久作废（invalidated 一旦置位不复位，
+//    改回原值也不能恢复确认资格）；在途请求同样立即作废并结束加载态。
+//  - 请求序号取自永不归零的单调计数器；连续生成只接纳「最近一次且输入未变」
+//    的响应，过期响应无论成功、HTTP 错误、连接异常还是解析失败都被直接丢弃，
+//    不改动方案、错误提示或较新请求的加载状态。
+const mergeState = {
+  lowerId: "",        // 所选下层 ID（合并后保留其 ID 与颜色）
+  upperId: "",        // 所选上层 ID（合并后删除）
+  plan: null,         // 最近一次成功返回的待确认合并方案
+  planKey: "",        // 方案产生时的输入指纹
+  invalidated: false, // 方案展示后参与输入是否曾变化：一旦置位，改回原值也不恢复
+  inflightId: 0,      // 当前仍可落地的在途请求序号；0 表示无
+  inflightSig: "",    // 当前在途请求发出时的输入指纹
+  reqSeq: 0,          // 单调递增的请求序号源，永不归零
+};
+
+const elMergeCard = $("#mergeCard");
+const elMergeLower = $("#mergeLower");
+const elMergeUpper = $("#mergeUpper");
+const elMergeRunBtn = $("#mergeRunBtn");
+const elMergeHint = $("#mergeHint");
+const elMergeErrors = $("#mergeErrors");
+const elMergeResult = $("#mergeResult");
+const elMergeStatus = $("#mergeStatus");
+
+function mergeSignature() {
+  // 用于判断已有方案 / 在途请求是否对应当前输入：图层、样本、关系、所选两层
+  // 与当前有效最佳叠序（无有效求解顺序时记为空，方案随输入变化必然失配）
+  return JSON.stringify({
+    layers: state.layers,
+    samples: state.samples,
+    relations: state.relations,
+    lowerId: mergeState.lowerId,
+    upperId: mergeState.upperId,
+    order: lastSolveResult && lastSolveEpoch === solveInputEpoch ? lastSolveResult.order : [],
+  });
+}
+
+function syncMergePanel(solveResult) {
+  // 合并后至少保留 2 层：当前不足 3 层时本功能不可用
+  if (state.layers.length < 3) {
+    elMergeCard.hidden = true;
+    mergeState.plan = null;
+    mergeState.planKey = "";
+    mergeState.invalidated = false;
+    elMergeResult.innerHTML = "";
+    elMergeErrors.hidden = true;
+    return;
+  }
+  elMergeCard.hidden = false;
+  const order = solveResult.order;
+  // 所选两层若已不在当前叠序中（或相同），按当前叠序重新默认：
+  // 优先第一对相邻且规范化 HEX 相同的层，否则取最顶部相邻两层
+  const valid =
+    mergeState.lowerId !== mergeState.upperId &&
+    order.includes(mergeState.lowerId) &&
+    order.includes(mergeState.upperId);
+  if (!valid) {
+    let lower = order[order.length - 2];
+    let upper = order[order.length - 1];
+    for (let k = 0; k < order.length - 1; k++) {
+      const a = layerById(order[k]);
+      const b = layerById(order[k + 1]);
+      const ha = a && normalizeHex(a.color);
+      const hb = b && normalizeHex(b.color);
+      if (ha && ha === hb) {
+        lower = order[k];
+        upper = order[k + 1];
+        break;
+      }
+    }
+    mergeState.lowerId = lower;
+    mergeState.upperId = upper;
+  }
+  renderMergeControls();
+  markMergeStaleness();
+}
+
+function renderMergeControls() {
+  const order = lastSolveResult && lastSolveEpoch === solveInputEpoch ? lastSolveResult.order : [];
+  const opts = order
+    .map((id) => {
+      const layer = layerById(id);
+      const hex = (layer && normalizeHex(layer.color)) || "";
+      return `<option value="${escapeHtml(id)}">${escapeHtml(id)}${hex ? `（${hex}）` : ""}</option>`;
+    })
+    .join("");
+  elMergeLower.innerHTML = opts;
+  elMergeUpper.innerHTML = opts;
+  elMergeLower.value = mergeState.lowerId;
+  elMergeUpper.value = mergeState.upperId;
+  updateMergeRunHint();
+}
+
+function updateMergeRunHint() {
+  const lower = mergeState.lowerId;
+  const upper = mergeState.upperId;
+  const solveValid = lastSolveResult && lastSolveEpoch === solveInputEpoch;
+  elMergeRunBtn.disabled =
+    !solveValid || !lower || !upper || lower === upper || mergeState.inflightId !== 0;
+  if (!solveValid) {
+    elMergeHint.textContent = "当前校准输入尚无有效求解结果，无法生成合并方案";
+  } else if (!lower || !upper || lower === upper) {
+    elMergeHint.textContent = "请选择两个不同的图层（下层在下、上层在上）";
+  } else {
+    elMergeHint.textContent =
+      `将校验 ${lower}（下）与 ${upper}（上）在当前最佳叠序中相邻且规范化 HEX 相同，生成待确认方案`;
+  }
+}
+
+function markMergeStaleness() {
+  // 参与输入（图层 / 样本 / 关系 / 所选两层 / 当前有效最佳叠序）变化时：在途
+  // 请求（及其响应）立即失效，不能再改动方案 / 错误 / 加载状态。这里仅结束
+  // 加载态并作废在途请求；旧响应返回后会在响应守卫处被丢弃。reqSeq 不清零。
+  if (mergeState.inflightId !== 0 && mergeSignature() !== mergeState.inflightSig) {
+    mergeState.inflightId = 0;
+    mergeState.inflightSig = "";
+    elMergeStatus.textContent = "";
+    elMergeStatus.className = "status";
+  }
+  updateMergeRunHint();
+  if (!mergeState.plan) return;
+  if (mergeSignature() !== mergeState.planKey) mergeState.invalidated = true;
+  // invalidated 一旦置位不复位：改回原值也不能恢复确认资格
+  const dead = mergeState.invalidated;
+  const old = elMergeResult.querySelector(".stale-note");
+  const btn = elMergeResult.querySelector('button[data-act="merge-confirm"]');
+  if (dead) {
+    if (!old) {
+      const note = document.createElement("div");
+      note.className = "stale-note";
+      note.textContent =
+        "图层、样本、关系或所选两层已变化，以下合并方案已作废（即使改回原值也不能再确认），请重新生成方案。";
+      elMergeResult.prepend(note);
+    }
+    if (btn) btn.disabled = true;
+  }
+}
+
+// 方案是否仍对应当前输入且保有确认资格；false 时「确认」按钮不可点击
+function mergePlanFresh() {
+  return (
+    !!mergeState.plan && !mergeState.invalidated && mergeSignature() === mergeState.planKey
+  );
+}
+
+// 响应守卫：只有「当前在途请求」且「发出后参与输入未再变化」的响应可以落地；
+// 响应体读完之后再次判定，读取窗口内的变化同样作数。
+function mergeResponseCurrent(reqId, reqSig) {
+  return (
+    mergeState.inflightId === reqId &&
+    mergeState.inflightSig === reqSig &&
+    mergeSignature() === reqSig
+  );
+}
+
+async function runMerge() {
+  // 直接调用也不得发送请求：必须有「当前校准输入对应的有效求解顺序」、
+  // 两个不同的所选图层且无在途请求
+  if (!lastSolveResult || lastSolveEpoch !== solveInputEpoch) return;
+  if (!mergeState.lowerId || !mergeState.upperId) return;
+  if (mergeState.lowerId === mergeState.upperId || mergeState.inflightId !== 0) return;
+
+  const payload = {
+    ...buildSolvePayload(),
+    order: [...lastSolveResult.order], // 固定当前有效最佳叠序
+    lowerId: mergeState.lowerId,
+    upperId: mergeState.upperId,
+  };
+  const reqId = ++mergeState.reqSeq;
+  mergeState.inflightId = reqId;
+  const reqSig = mergeSignature();
+  mergeState.inflightSig = reqSig;
+
+  elMergeStatus.textContent = "生成方案中…";
+  elMergeStatus.className = "status busy";
+  elMergeErrors.hidden = true;
+  updateMergeRunHint();
+
+  try {
+    const resp = await fetch("/api/merge-layers", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    if (!mergeResponseCurrent(reqId, reqSig)) return; // 已有更新的请求或输入已变，丢弃旧响应
+    const data = await resp.json();
+    // 响应体读取期间输入可能又变、或较新请求已发出：落地前必须再过一次守卫
+    if (!mergeResponseCurrent(reqId, reqSig)) return;
+    mergeState.inflightId = 0;
+    mergeState.inflightSig = "";
+    elMergeStatus.textContent = "";
+    elMergeStatus.className = "status";
+    updateMergeRunHint();
+    if (!resp.ok) {
+      // 生成失败不改动任何校准输入，仅展示错误
+      showMergeErrors(data.errors || [{ scope: "form", message: "合并方案生成失败" }]);
+      return;
+    }
+    mergeState.plan = data;
+    mergeState.planKey = reqSig;
+    mergeState.invalidated = false;
+    renderMergePlan(data);
+  } catch (err) {
+    if (!mergeResponseCurrent(reqId, reqSig)) return;
+    mergeState.inflightId = 0;
+    mergeState.inflightSig = "";
+    elMergeStatus.textContent = "";
+    elMergeStatus.className = "status";
+    updateMergeRunHint();
+    showMergeErrors([{ scope: "form", message: "无法连接计算服务：" + err.message }]);
+  }
+}
+
+function showMergeErrors(errors) {
+  elMergeErrors.innerHTML =
+    "<ul>" + errors.map((er) => `<li>${escapeHtml(er.message)}</li>`).join("") + "</ul>";
+  elMergeErrors.hidden = false;
+}
+
+function renderMergePlan(plan) {
+  elMergeErrors.hidden = true;
+  const m = plan.mergedLayer;
+  const rm = plan.removedLayer;
+  const lowerLayer = layerById(m.id);
+  const lowerAlpha =
+    lowerLayer && Number.isFinite(lowerLayer.opacity) ? lowerLayer.opacity : null;
+  const byId = {};
+  plan.layers.forEach((l) => {
+    byId[l.id] = l;
+  });
+  const chips = plan.order
+    .map((id) => {
+      const l = byId[id];
+      return `
+        <span class="chip">
+          <span class="dot" style="background:${hexToRgba(l.color, l.opacity)}" title="${escapeHtml(id)}"></span>
+          <span class="cid">${escapeHtml(id)}</span>
+          <span class="cop">α=${fmtOpacity(l.opacity)}</span>
+        </span>`;
+    })
+    .join('<span class="order-sep">↑</span>');
+
+  const fresh = mergePlanFresh();
+  elMergeResult.innerHTML = `
+    <div class="merge-plan">
+      <div class="suggest-sec-title">待确认合并方案（只展示、不自动修改；确认后才整批写回）</div>
+      <div class="merge-plan-row">
+        <span class="mini-dot" style="background:${hexToRgba(m.color, m.opacity)}"></span>
+        保留下层 <b class="hexval">${escapeHtml(m.id)}</b>（颜色 <span class="hexval">${m.color}</span>）：
+        不透明度 1−(1−${lowerAlpha == null ? "?" : fmtOpacity(lowerAlpha)})(1−${fmtOpacity(rm.opacity)})
+        ＝ <b>α=${fmtOpacity(m.opacity)}</b>；删除上层
+        <b class="hexval">${escapeHtml(rm.id)}</b>（原 α=${fmtOpacity(rm.opacity)}）
+      </div>
+      <div class="merge-plan-row">
+        <span class="hint">合并后叠序（底 → 顶，原顺序删去上层）：</span>
+        <span class="checker"><span class="order-chips">
+          <span class="order-ends">底</span>${chips}<span class="order-ends">↑ 顶</span>
+        </span></span>
+      </div>
+      <div class="merge-plan-row hint">
+        样本不变（${plan.samples.length} 组）；关系 ${state.relations.length} 条 → ${plan.relations.length} 条
+        （上层 ID 已改为下层 ID，两层间关系已移除，重复对保留首次出现者）；
+        其余图层保持不变。
+      </div>
+      <div class="merge-plan-row hint">
+        保真验证：各样本未取整预测 RGB 与合并前各通道最大相差
+        ${plan.maxChannelDiff === 0 ? "0" : plan.maxChannelDiff.toExponential(2)}（≤1e-9，合并严格保真）。
+      </div>
+      <div class="infer-actions">
+        <button class="btn btn-small" data-act="merge-confirm" type="button"
+                ${fresh ? "" : "disabled"}>确认合并并整批写回后重新求解</button>
+        <span class="hint">写回图层与关系后沿用输入变更流程：旧计算与调序执行失效（已确认记录保留），自动重新求解</span>
+      </div>
+    </div>
+  `;
+  if (!fresh) markMergeStaleness();
+}
+
+function confirmMergePlan() {
+  const plan = mergeState.plan;
+  // 确认前再次核对资格：方案已失效（参与输入曾变化，即使改回原值）时不改任何输入
+  if (!plan || !mergePlanFresh() || mergeState.inflightId !== 0) return;
+  // 整批写回：图层（保留下层 ID 与颜色、不透明度已合并、删除上层、其余不变）
+  // 与关系（上层 ID 已改为下层 ID、两层间关系已移除、重复对保留首次出现者）；样本不变
+  state.layers = plan.layers.map((l) => ({ id: l.id, color: l.color, opacity: l.opacity }));
+  state.relations = plan.relations.map((r) => ({ lower: r.lower, upper: r.upper }));
+  // 方案一经确认即消费：清空，不能重复使用同一方案再次写回
+  mergeState.plan = null;
+  mergeState.planKey = "";
+  mergeState.invalidated = false;
+  elMergeResult.innerHTML = "";
+  elMergeErrors.hidden = true;
+  // 沿用输入变更流程：旧计算与调序执行失效（已确认记录保留、输入不回滚）、重新求解
+  render();
+  noteSolveInputChanged();
+  markCycleStaleness();
+  markInferStaleness();
+  markSuggestStaleness();
+  renderSuggestControls();
+  markReviewStaleness();
+  markTransitionStaleness();
+  markExtractStaleness();
+  markMergeStaleness();
   runSolve();
 }
 
@@ -2161,6 +2493,7 @@ function appendReviewSample() {
   markReviewStaleness();
   markTransitionStaleness();
   markExtractStaleness();
+  markMergeStaleness();
   runSolve();
 }
 
@@ -2426,6 +2759,7 @@ async function confirmCyclePlan() {
     markSuggestStaleness();
     markReviewStaleness();
     markTransitionStaleness();
+    markMergeStaleness();
     clearCyclePlan();
     showErrors([]);
     lastSolveResult = data;
@@ -3228,6 +3562,7 @@ function appendExtractedSamples() {
   renderSuggestControls();
   markReviewStaleness();
   markTransitionStaleness();
+  markMergeStaleness();
   runSolve();
 }
 

@@ -264,6 +264,38 @@
           <div id="inferResult"></div>
         </div>
       </div>
+      <!-- 相邻同色图层合并 -->
+      <div class="card merge-card" id="mergeCard" hidden>
+        <div class="card-head">
+          <h2>相邻同色图层合并 <span class="hint">（把当前有效最佳叠序中相邻且同色的两层合并为一层）</span></h2>
+          <span id="mergeStatus" class="status"></span>
+        </div>
+        <div id="mergeBody">
+          <div class="infer-field">
+            <div class="infer-field-label">
+              待合并两层（从当前有效最佳叠序中选；须在该叠序中相邻且规范化 HEX 相同，
+              保留下层 ID 与颜色，合并后至少保留 2 层）
+            </div>
+            <div class="merge-pick-row">
+              <label class="merge-pick-label">下层
+                <select id="mergeLower" data-act="merge-lower"></select>
+              </label>
+              <span class="relation-arrow">▲ 其上相邻叠着</span>
+              <label class="merge-pick-label">上层
+                <select id="mergeUpper" data-act="merge-upper"></select>
+              </label>
+              <span class="relation-arrow">（合并后删除）</span>
+            </div>
+          </div>
+          <div class="infer-actions">
+            <button id="mergeRunBtn" class="btn btn-small" data-act="merge-run"
+                    type="button">生成合并方案</button>
+            <span id="mergeHint" class="hint">沿用当前图层、样本、先后关系与当前有效最佳叠序</span>
+          </div>
+          <div id="mergeErrors" class="infer-errors" hidden></div>
+          <div id="mergeResult"></div>
+        </div>
+      </div>
     </section>
   </main>
 

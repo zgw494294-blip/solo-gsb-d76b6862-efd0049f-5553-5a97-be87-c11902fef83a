@@ -607,6 +607,38 @@ a.btn.composite-download.is-disabled {
 .applied-note { font-size: 12px; color: var(--ok); }
 .stale-note { font-size: 12px; color: #b45309; }
 
+/* ------------------------- 相邻同色图层合并 ------------------------- */
+.merge-card { margin-top: 16px; }
+.merge-pick-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  font-size: 13px;
+}
+.merge-pick-row select {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  padding: 4px 6px;
+  margin-left: 4px;
+}
+.merge-plan-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  font-size: 13px;
+  margin: 6px 0;
+}
+.merge-plan-row .mini-dot {
+  width: 14px;
+  height: 14px;
+  border-radius: 4px;
+  border: 1px solid rgba(0, 0, 0, 0.2);
+  display: inline-block;
+  flex: none;
+}
+
 /* ------------------------- 过渡步骤规划 ------------------------- */
 .transition-card { margin-top: 16px; }
 #transitionLimit { width: 150px; margin-right: 8px; }

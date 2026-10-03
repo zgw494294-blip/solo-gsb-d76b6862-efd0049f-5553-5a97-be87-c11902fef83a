@@ -15,6 +15,7 @@ from .core import (
     CalibrationError,
     confirm_cycle_resolution,
     infer_opacities,
+    merge_layers,
     plan_transition,
     resolve_cycle,
     review_measurement,
@@ -22,7 +23,7 @@ from .core import (
     suggest_background,
 )
 from .extract import extract_sample_pairs
-app = FastAPI(title="透明图层叠序校准台", version="1.7.0")
+app = FastAPI(title="透明图层叠序校准台", version="1.8.0")
 
 
 @app.get("/api/health")
@@ -249,6 +250,22 @@ async def api_extract_samples(request: Request) -> JSONResponse:
 
     try:
         result = extract_sample_pairs(images["background"], images["measured"], raw_points)
+    except CalibrationError as exc:
+        return JSONResponse(status_code=400, content={"errors": exc.errors})
+    return JSONResponse(status_code=200, content=result)
+
+
+@app.post("/api/merge-layers")
+async def api_merge_layers(request: Request) -> JSONResponse:
+    try:
+        payload: Any = await request.json()
+    except Exception:
+        return JSONResponse(
+            status_code=400,
+            content={"errors": [{"scope": "form", "message": "请求体不是合法的 JSON"}]},
+        )
+    try:
+        result = merge_layers(payload)
     except CalibrationError as exc:
         return JSONResponse(status_code=400, content={"errors": exc.errors})
     return JSONResponse(status_code=200, content=result)
