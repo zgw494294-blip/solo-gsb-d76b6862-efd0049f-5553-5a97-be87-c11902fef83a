@@ -131,6 +131,41 @@
         </div>
       </div>
 
+      <!-- 相邻同色图层合并 -->
+      <div class="card merge-card" id="mergeCard" hidden>
+        <div class="card-head">
+          <h2>相邻同色图层合并 <span class="hint">（把当前有效最佳叠序中相邻且同色的两层并为一层）</span></h2>
+          <span id="mergeStatus" class="status"></span>
+        </div>
+        <div id="mergeBody">
+          <div class="infer-field">
+            <div class="infer-field-label">
+              当前有效最佳叠序（底 → 顶；同色相邻层可合并，下方标记「可合并」）
+            </div>
+            <div id="mergeOrder" class="infer-order"></div>
+          </div>
+          <div class="infer-field">
+            <div class="infer-field-label">
+              待合并两层：保留下层 ID 与颜色，不透明度取 1−(1−a下)(1−a上)，删除上层；
+              关系中的上层 ID 改为下层 ID，两层间关系移除、重复对保留首次出现者，样本不变
+            </div>
+            <div class="merge-selects">
+              <select id="mergeLower" data-act="merge-lower"></select>
+              <span class="relation-arrow">（下层）相邻同色 ⇅</span>
+              <select id="mergeUpper" data-act="merge-upper"></select>
+              <span class="relation-arrow">（上层）</span>
+            </div>
+          </div>
+          <div class="infer-actions">
+            <button id="mergeRunBtn" class="btn btn-small" data-act="merge-run"
+                    type="button">生成合并方案</button>
+            <span id="mergeHint" class="hint">需要当前有效求解结果</span>
+          </div>
+          <div id="mergeErrors" class="infer-errors" hidden></div>
+          <div id="mergeResult"></div>
+        </div>
+      </div>
+
       <!-- 先后关系成环解除 -->
       <div class="card cycle-card" id="cycleCard" hidden>
         <div class="card-head">

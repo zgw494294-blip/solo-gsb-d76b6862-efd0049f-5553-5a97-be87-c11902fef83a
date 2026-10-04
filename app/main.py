@@ -15,6 +15,7 @@ from .core import (
     CalibrationError,
     confirm_cycle_resolution,
     infer_opacities,
+    merge_layers,
     plan_transition,
     resolve_cycle,
     review_measurement,
@@ -22,7 +23,7 @@ from .core import (
     suggest_background,
 )
 from .extract import extract_sample_pairs
-app = FastAPI(title="透明图层叠序校准台", version="1.7.0")
+app = FastAPI(title="透明图层叠序校准台", version="1.8.0")
 
 
 @app.get("/api/health")
@@ -137,6 +138,25 @@ async def api_confirm_cycle_resolution(request: Request) -> JSONResponse:
         )
     try:
         result = confirm_cycle_resolution(payload)
+    except CalibrationError as exc:
+        return JSONResponse(status_code=400, content={"errors": exc.errors})
+    return JSONResponse(status_code=200, content=result)
+
+
+@app.post("/api/merge-layers")
+async def api_merge_layers(request: Request) -> JSONResponse:
+    """相邻同色图层合并：接收校准输入、完整合法底→顶顺序与待合并的下层 / 上层
+    ID，返回合并后的新输入（layers/samples/relations）、合并顺序与逐样本等价
+    校验结果。服务端不保存、不改写任何输入；非相邻、异色或其他非法输入均 400。"""
+    try:
+        payload: Any = await request.json()
+    except Exception:
+        return JSONResponse(
+            status_code=400,
+            content={"errors": [{"scope": "form", "message": "请求体不是合法的 JSON"}]},
+        )
+    try:
+        result = merge_layers(payload)
     except CalibrationError as exc:
         return JSONResponse(status_code=400, content={"errors": exc.errors})
     return JSONResponse(status_code=200, content=result)

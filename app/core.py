@@ -16,6 +16,10 @@
 - 过渡步骤规划：给出当前实际底→顶叠序与非负有限的过渡总误差上限，在
   「满足先后关系且旧样本总误差不超过上限」的状态图上，以相邻交换为边做 BFS，
   求交换次数最少的完整路径；并列时按每步交换前两层 ID 对序列的字典序决胜
+- 相邻同色图层合并：把当前有效最佳叠序中相邻且规范化 HEX 相同的两层合并为
+  一层——保留下层 ID 与颜色，不透明度取 1−(1−a下)(1−a上)，删除上层；
+  关系中的上层 ID 改为下层 ID、两层间关系移除、重复对保留首次出现者；
+  样本不变，并逐样本校验合并前后未取整预测 RGB 各通道差 ≤ 1e-9
 - 图片取点坐标解析：1～4 个互异的零基整数坐标（左上角为原点），供从背景图
   与叠层实测图的对应像素提取校准样本使用
 """
@@ -1499,3 +1503,258 @@ def fmt_num(v: float) -> str:
     if r == int(r):
         return str(int(r))
     return f"{r:.6g}"
+
+
+# ----------------------------------------------------------- 相邻同色图层合并 --
+
+
+def _parse_merge_order(
+    raw_order: Any, parsed: _Parsed, errors: list[dict[str, Any]]
+) -> list[str] | None:
+    """校验「恰好包含全部图层 ID 各一次」的完整合法底→顶顺序（merge 专用）。"""
+    n = len(parsed.ids)
+    id_set = {lid for lid in parsed.ids if lid}
+    order_ids: list[str] = []
+    ok = True
+    if not isinstance(raw_order, list):
+        errors.append(
+            _err("order", "缺少 order 列表或其格式不正确：必须按底→顶顺序给出全部图层 ID")
+        )
+        return None
+    if len(raw_order) != n:
+        errors.append(
+            _err("order", f"order 必须恰好包含全部 {n} 个图层 ID（各一次），当前 {len(raw_order)} 个")
+        )
+        ok = False
+    seen: set[str] = set()
+    for x in raw_order:
+        if not isinstance(x, str) or not x.strip():
+            errors.append(_err("order", f"order 中的图层 ID 非法：{x!r}（必须是已存在的图层 ID）"))
+            ok = False
+            continue
+        x = x.strip()
+        if x not in id_set:
+            errors.append(_err("order", f"order 中的图层 ID 不存在：{x!r}"))
+            ok = False
+        elif x in seen:
+            errors.append(_err("order", f"order 中图层 ID 重复：{x}，每个图层必须且只能出现一次"))
+            ok = False
+        else:
+            seen.add(x)
+        order_ids.append(x)
+    if not ok:
+        return None
+    return order_ids
+
+
+def merge_layers(payload: Any) -> dict[str, Any]:
+    """把当前有效最佳叠序中相邻且规范化 HEX 相同的两层合并为一层。
+
+    合并规则（纯查询：服务端不保存、不改写任何输入，返回新输入与合并顺序）：
+    - 保留下层 ID 与颜色，新不透明度 ＝ 1−(1−a下)(1−a上)（a下、a上为两层原值）；
+    - 删除上层，其他图层及样本不变，合并后至少保留 MIN_LAYERS 层；
+    - 关系中的上层 ID 一律改为下层 ID（其作下方或上方都改写），两层之间的
+      关系（自环方向）移除；改写后出现的重复对保留原顺序中首次出现者；
+    - 原顺序删去上层 ID 即新叠序；逐样本校验合并前后未取整预测 RGB 各通道
+      差均不超过 1e-9（同色相邻层 over 合成与单层等价，仅余浮点舍入）。
+    """
+    parsed, errors = _parse_inputs(payload)
+    assert isinstance(payload, dict)  # _parse_inputs 已保证是 dict
+
+    order_ids = _parse_merge_order(payload.get("order"), parsed, errors)
+
+    # ---- 待合并两层（下层 / 上层 ID）---------------------------------------
+    raw_lower = payload.get("lowerId")
+    raw_upper = payload.get("upperId")
+    lower_id = raw_lower.strip() if isinstance(raw_lower, str) else None
+    upper_id = raw_upper.strip() if isinstance(raw_upper, str) else None
+    id_set = {lid for lid in parsed.ids if lid}
+    lower_idx = parsed.seen_ids.get(lower_id) if lower_id in id_set else None
+    upper_idx = parsed.seen_ids.get(upper_id) if upper_id in id_set else None
+    if lower_id is None or lower_id not in id_set:
+        errors.append(_err("merge", f"待合并下层图层 ID 不存在：{raw_lower!r}"))
+    if upper_id is None or upper_id not in id_set:
+        errors.append(_err("merge", f"待合并上层图层 ID 不存在：{raw_upper!r}"))
+
+    if errors:
+        raise CalibrationError(errors)
+    _raise_if_cycle(parsed)
+    assert order_ids is not None and lower_idx is not None and upper_idx is not None
+
+    n = len(parsed.ids)
+
+    # ---- 顺序必须符合全部先后关系（完整合法顺序）---------------------------
+    order_idx = [parsed.seen_ids[x] for x in order_ids]
+    pos = [0] * n
+    for p, idx in enumerate(order_idx):
+        pos[idx] = p
+    for li, ui in parsed.pairs:
+        if pos[li] >= pos[ui]:
+            raise CalibrationError(
+                [
+                    _err(
+                        "order",
+                        f"所给顺序不符合先后关系：{parsed.ids[li]} 必须在 {parsed.ids[ui]} 下方（底 → 顶）",
+                    )
+                ]
+            )
+
+    # ---- 两层必须是所给顺序中的相邻层（下层恰在上层紧邻下方）----------------
+    if lower_idx == upper_idx:
+        raise CalibrationError([_err("merge", "待合并的下层与上层不能是同一个图层")])
+    p_lo, p_hi = pos[lower_idx], pos[upper_idx]
+    if p_lo + 1 != p_hi:
+        raise CalibrationError(
+            [
+                _err(
+                    "merge",
+                    f"图层 {parsed.ids[lower_idx]} 与 {parsed.ids[upper_idx]} 在所给底→顶顺序中"
+                    f"不相邻（分别位于第 {p_lo + 1}、{p_hi + 1} 层），只能合并相邻两层",
+                )
+            ]
+        )
+
+    # ---- 规范化 HEX 必须相同 -----------------------------------------------
+    if parsed.hexes[lower_idx] != parsed.hexes[upper_idx]:
+        raise CalibrationError(
+            [
+                _err(
+                    "merge",
+                    f"图层 {parsed.ids[lower_idx]}（{parsed.hexes[lower_idx]}）与 "
+                    f"{parsed.ids[upper_idx]}（{parsed.hexes[upper_idx]}）颜色不同，"
+                    f"只能合并规范化 HEX 相同的相邻两层",
+                )
+            ]
+        )
+
+    # ---- 合并后至少保留 MIN_LAYERS 层 --------------------------------------
+    if n - 1 < MIN_LAYERS:
+        raise CalibrationError(
+            [
+                _err(
+                    "merge",
+                    f"当前仅 {n} 层，合并后为 {n - 1} 层，合并后至少需保留 {MIN_LAYERS} 层",
+                )
+            ]
+        )
+
+    a_lo = parsed.alphas[lower_idx]
+    a_hi = parsed.alphas[upper_idx]
+    merged_alpha = 1.0 - (1.0 - a_lo) * (1.0 - a_hi)
+
+    # ---- 新叠序：原顺序删去上层 ID -----------------------------------------
+    merged_order_idx = [i for i in order_idx if i != upper_idx]
+    merged_alphas = list(parsed.alphas)
+    merged_alphas[lower_idx] = merged_alpha
+
+    # ---- 逐样本等价校验：同色相邻两层 over 合成 ⇒ 单层 α=1−(1−a下)(1−a上)，
+    # 仅余浮点运算顺序差；任一通道超过 1e-9 即视为不能安全合并 --------------
+    max_diff = 0.0
+    for s in range(len(parsed.bg_hex)):
+        old_pred = render_stack(parsed.bg_srgb[s], order_idx, parsed.lins, parsed.alphas)
+        new_pred = render_stack(parsed.bg_srgb[s], merged_order_idx, parsed.lins, merged_alphas)
+        for c in range(3):
+            max_diff = max(max_diff, abs(old_pred[c] * 255.0 - new_pred[c] * 255.0))
+    if max_diff > 1e-9:
+        raise CalibrationError(
+            [
+                _err(
+                    "merge",
+                    f"合并后存在样本未取整预测 RGB 通道差 {max_diff:.3g} 超过 1e-9 上限，"
+                    f"不能安全合并这两层",
+                )
+            ]
+        )
+
+    # ---- 关系改写：上层 ID 改为下层 ID，两层间关系移除，重复对保留首次出现者 --
+    new_relations: list[dict[str, Any]] = []
+    seen_new_pairs: set[tuple[str, str]] = set()
+    relationCountBefore = 0
+    raw_relations = payload.get("relations", [])
+    if isinstance(raw_relations, list):
+        for item in raw_relations[:MAX_RELATIONS]:
+            if not isinstance(item, dict):
+                continue
+            lo, hi = item.get("lower"), item.get("upper")
+            if not isinstance(lo, str) or lo.strip() not in id_set:
+                continue
+            if not isinstance(hi, str) or hi.strip() not in id_set:
+                continue
+            lo, hi = lo.strip(), hi.strip()
+            relationCountBefore += 1
+            # 两层之间的关系（上→下反向关系已被完整合法顺序拦截；此处为防御）移除
+            if (lo, hi) == (lower_id, upper_id) or (lo, hi) == (upper_id, lower_id):
+                continue
+            if lo == upper_id:
+                lo = lower_id
+            if hi == upper_id:
+                hi = lower_id
+            if lo == hi:  # 改写后退化为自环：移除
+                continue
+            key = (lo, hi)
+            if key in seen_new_pairs:  # 重复对保留原顺序中首次出现者
+                continue
+            seen_new_pairs.add(key)
+            new_relations.append({"lower": lo, "upper": hi})
+
+    # ---- 新输入：删去上层、下层不透明度替换；样本规范化原样返回 --------------
+    new_layers = [
+        {
+            "id": parsed.ids[i],
+            "color": parsed.hexes[i],
+            "opacity": merged_alpha if i == lower_idx else parsed.alphas[i],
+        }
+        for i in range(n)
+        if i != upper_idx
+    ]
+    new_samples = [
+        {"background": parsed.bg_hex[s], "target": parsed.tg_hex[s]}
+        for s in range(len(parsed.bg_hex))
+    ]
+
+    # ---- 防御：新输入必须合法、无环，且新顺序完整满足新关系 ------------------
+    check_payload = {
+        "layers": new_layers,
+        "samples": new_samples,
+        "relations": new_relations,
+    }
+    check_parsed, check_errors = _parse_inputs(check_payload)
+    if check_errors:
+        raise CalibrationError(
+            [_err("merge", "合并后的输入未通过校验，已中止合并：" +
+                  "；".join(e["message"] for e in check_errors))]
+        )
+    check_n = len(check_parsed.ids)
+    check_pos = [0] * check_n
+    new_order_ids = [parsed.ids[i] for i in merged_order_idx]
+    for p, x in enumerate(new_order_ids):
+        check_pos[check_parsed.seen_ids[x]] = p
+    for li, ui in check_parsed.pairs:
+        if check_pos[li] >= check_pos[ui]:  # pragma: no cover  # 理论不可达
+            raise CalibrationError([_err("merge", "合并后的顺序不满足改写后的先后关系")])
+
+    new_index_by_old = {
+        old: new for new, old in enumerate(i for i in range(n) if i != upper_idx)
+    }
+
+    return {
+        "lowerId": lower_id,
+        "upperId": upper_id,
+        "lowerIndex": lower_idx,
+        "upperIndex": upper_idx,
+        "mergedColor": parsed.hexes[lower_idx],
+        "lowerOpacity": a_lo,
+        "upperOpacity": a_hi,
+        "mergedOpacity": merged_alpha,
+        "order": order_ids,
+        "orderIndexes": order_idx,
+        "newLayers": new_layers,
+        "newSamples": new_samples,
+        "newRelations": new_relations,
+        "newOrder": new_order_ids,
+        "newOrderIndexes": [new_index_by_old[i] for i in merged_order_idx],
+        "relationCountBefore": relationCountBefore,
+        "relationCountAfter": len(new_relations),
+        "maxRgbDelta": max_diff,
+        "rgbTolerance": 1e-9,
+    }

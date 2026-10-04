@@ -457,6 +457,43 @@ a.btn.composite-download.is-disabled {
   font-size: 12px;
 }
 
+/* ------------------------- 相邻同色图层合并 ------------------------- */
+.merge-card { margin-top: 16px; }
+.merge-selects {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  border: 1px dashed var(--line);
+  border-radius: 8px;
+  padding: 8px 10px;
+  background: #fbfcfe;
+}
+.merge-selects select { min-width: 150px; }
+.merge-order-block { margin: 8px 0; }
+.merge-plan-panel {
+  border: 1px dashed var(--line);
+  border-radius: 8px;
+  padding: 12px;
+  margin-top: 10px;
+  background: #fbfcfe;
+}
+.merge-plan-panel .mini {
+  display: inline-block;
+  width: 16px;
+  height: 16px;
+  border-radius: 4px;
+  border: 1px solid rgba(0, 0, 0, 0.15);
+  vertical-align: middle;
+  margin: 0 4px;
+}
+.merge-plan-panel .adj-table th { width: 96px; white-space: nowrap; }
+.chip.merged .dot {
+  outline: 2px solid var(--ok);
+  outline-offset: 1px;
+}
+.chip.merged .cid { color: var(--ok); font-weight: 600; }
+
 /* ------------------------- 不透明度反推 ------------------------- */
 .infer-card { margin-top: 16px; }
 .infer-field { margin-bottom: 10px; }
